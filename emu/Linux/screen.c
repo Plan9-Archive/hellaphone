@@ -1,3 +1,7 @@
+/*
+ * This file is based on a port to the OLPC by Andrey Mirtchovski et. al.
+ */
+
 #include "dat.h"
 #include "fns.h"
 #include "../port/error.h"
@@ -11,22 +15,20 @@
 
 Point mousexy(void);
 
-static ulong theDisplayChannel = 0;
-static int theDisplayDepth = 0;
-static int theScreenIsInited = 0;
-static unsigned char* theScreenData = 0;
-static unsigned char* theFrameBuffer = 0;
-static Point thePointerPosition = { 0, 0 };
-static Lock thePointerLock;
-static uchar* thePointer = 0;
-static int thePointerHeight = 0;
-static int thePointerWidth = 0;
+static ulong displaychannel = 0;
+static int screeninited = 0;
+static unsigned char* screendata = 0;
+static unsigned char* framebuffer = 0;
+static Point pointerposition = { 0, 0 };
+static Lock pointerlock;
+static uchar* pointer = 0;
+static int pointerheight = 0;
+static int pointerwidth = 0;
 
-static void screenProc ( void* );
-static void initScreen ( int, int, ulong*, int* );
-void drawPointer ( int, int );
+static void initscreen ( int, int, ulong*, int* );
+void drawpointer ( int, int );
 
-static int eventfd;
+static int eventfd, /*mainbuttonfd, */volbuttonfd;
 static int mousepid;
 
 static int b = 0;
@@ -34,295 +36,421 @@ static int DblTime = 300000;
 static int x, y, p, dbl = 0;
 static int lastb;
 static int touch = 0;
-static int lastval = 0;
+
+static int xmin = 2;
+static int xadjust = 3; //shifts mouse left
+static int lowx = 5; //should be xmin + xadjust
+static int ymin = 2;
+static int yadjust = 11; //shifts mouse up
+static int lowy = 13; //should be ymin + yadjust
 
 static void 
 touchscreen(struct input_event* ev, int count)
 {
+    int i;
+    static struct timeval lastt;
+
+    for (i=0; i < count; i++){
+	printf("ev[%d]: type = 0x%x, code = 0x%x, value = 0x%x\n", i, ev[i].type, ev[i].code, ev[i].value);
+	if(0) {
+		fprint(2, "%d/%d [%d] ", i, count, ev[i].code);
+	}
+	switch(ev[i].type){
+	case EV_ABS:
+	    switch(ev[i].code){
+	    case ABS_X:
+		x = ev[i].value;
+		break;
+	    case ABS_Y:
+		y = ev[i].value;
+		break;
+	    case ABS_PRESSURE:
+		p = ev[i].value;
+		break;
+	    case 0x30:		// ABS_MT_TOUCH_MAJOR
+		if (ev[i].value) {
+		    touch = 1;
+		    b = 1;
+		    printf("Click\n");
+		} else if (ev[i].value == 0) {
+		    touch = 0;
+		    b = 0;
+		}
+		break;
+		//lastval = ev[i].value;
+	    case 0x36:		// ABS_MT_POSITION_X
+				//if (touch && lastval == 0)
+		if(!rotation_opt) {
+			if (ev[i].value > lowx)
+				x = ev[i].value - xadjust;
+			else
+				x = xmin;
+		} else {
+			if (ev[i].value > lowy)
+				y = ev[i].value - yadjust;
+			else
+				y = ymin;
+		}
+		break;
+	    case 0x35:		//ABS_MT_POSITION_Y
+				//if (touch && lastval == 0)
+		if(!rotation_opt) {
+			if (Ysize-ev[i].value > lowy)
+				y = Ysize-ev[i].value - yadjust;
+			else
+				y = ymin;
+		} else {
+			if (ev[i].value > lowx)
+				x = ev[i].value - xadjust;
+			else
+				x = xmin;
+		}
+		break;
+	    }
+	    break;
+	case EV_KEY:
+	    if (ev[i].value){
+		touch=1;
+		b = 1;
+		if(b==lastb && ev[i].time.tv_sec == lastt.tv_sec &&
+		   (ev[i].time.tv_usec-lastt.tv_usec) < DblTime)
+		    dbl = 1;
+		lastb = b;
+		lastt = ev[i].time;
+		if(dbl)
+		    b = b | 1<<8;
+	    } else {
+		touch = 0;
+		lastb = b;
+		lastt = ev[i].time;
+		b = 0;
+	    }
+	    break;
+	case EV_SYN:
+	    mousetrack(b, x, y, 0);
+	    return;
+	}
+    }
+}
+
+//static void 
+//mainbuttonread(struct input_event* ev, int count)
+//{
+//	int i;
+//	
+//	for (i=0; i < count; i++){
+//		if(0) fprint(2, "%d/%d [%d] ", i, count, ev[i].code);
+//		if (ev[i].type == EV_KEY){
+//			if (ev[i].value){
+//				if (ev[i].code == 0x66){
+//					print("Home button pressed\n");}
+//				if (ev[i].code == 0x74){
+//					print("Power button pressed\n");}
+//		}}
+//	}
+//}
+
+static void 
+volbuttonread(struct input_event* ev, int count)
+{
 	int i;
-	static struct timeval lastt;
 	
 	for (i=0; i < count; i++){
 		if(0) fprint(2, "%d/%d [%d] ", i, count, ev[i].code);
-		switch(ev[i].type){
-			case EV_ABS:
-				switch(ev[i].code){
-				case ABS_X:
-					x = ev[i].value;
-					break;
-				case ABS_Y:
-					y = ev[i].value;
-					break;
-				case ABS_PRESSURE:
-					p = ev[i].value;
-					break;
-				case 0x30:		// ABS_MT_TOUCH_MAJOR
-					if (ev[i].value && lastval == 0) {
-						touch = 1;
-						b = 1;
-					} else if (ev[i].value == 0 && lastval == 0) {
-						touch = 0;
-						b = 0;
-					}
-					//lastval = ev[i].value;
-				case 0x36:		// ABS_MT_POSITION_X
-					//if (touch && lastval == 0)
-					if (lastval == 0)
-						if (ev[i].value > 8)
-							x = ev[i].value - 7;
-						else
-							x = 1;
-					break;
-				case 0x35:		//ABS_MT_POSITION_Y
-					//if (touch && lastval == 0)
-					if (lastval == 0)
-						if (Ysize-ev[i].value > 12)
-							y = Ysize-ev[i].value - 11;
-						else
-							y = 1;
-					break;
-				}
-				break;
-			case EV_KEY:
-				if (ev[i].value){
-					touch=1;
-					b = 1;
-					if(b==lastb && ev[i].time.tv_sec == lastt.tv_sec &&
-						(ev[i].time.tv_usec-lastt.tv_usec) < DblTime)
-						dbl = 1;
-					lastb = b;
-					lastt = ev[i].time;
-					if(dbl)
-						b = b | 1<<8;
-				} else {
-					touch = 0;
-					lastb = b;
-					lastt = ev[i].time;
-					b = 0;
-				}
-				break;
-			case EV_SYN:
-				if (ev[i].code == 0) {
-					lastval = 0;
-				} else {
-					lastval = 1;
-				}
-//				print("touch = %d, b = %d\n", touch, b);
-/*
-				if (i == 2) {
-					mousetrack(b, x, y, 0);
-				} else if (i > 2 && touch) {
-					mousetrack(b, x, y, 0);
-				} else if (!touch && lastb) {
-					mousetrack(b, x, y, 0);
-				}
-*/
-				mousetrack(b, x, y, 0);
-//				if (i==2 && p>0)		// motion
-//					mousetrack (b, x, y, 0);
-//				else if (i>3 && p>0 && touch)	// press
-//					mousetrack(b, x, y, 0);
-//				else if (i > 3 && touch) // press
-//					mousetrack(b, x, y, 1);
-//				else if (i>3 && p==0 && !touch)	// release
-//					mousetrack(0, 0, 0, 1);
-/*
-				if (touch) {
-					touch = 0;
-					b = 0;
-				} else {
-					touch = 1;
-					b = 1;
-				}
-*/
-				return;
-		}
+		if (ev[i].type == EV_KEY){
+			if (ev[i].value){
+				if (ev[i].code == 0x72){
+					print("Volume down\n");}
+				if (ev[i].code == 0x73){
+					print("Volume up\n");}
+		}}
 	}
 }
 
 static void fbreadmouse(void* v)
 {
+    int rd, value, size = sizeof(struct input_event);
+    struct input_event ev[64];
+    int i;
+    while (1){
+	if ((rd = read (eventfd, ev, sizeof(ev))) < size) {
+	    print("read %d instead of %d\n", rd, size);
+	    sleep(1);
+	}
+
+	for (i = 0; i < rd / size; i++) {
+	    //print("ev[%d]: type = 0x%x, code = 0x%x, value = 0x%x\n", i, ev[i].type, ev[i].code, ev[i].value);
+	    if (ev[i].code == 30) {
+		if (ev[i].value == 0) {
+			return;
+		}
+	    }
+	}
+	touchscreen(ev, (rd / size));
+    }
+}
+
+//static void fbreadmainbutton(void* v)
+//{
+//  int rd, value, size = sizeof(struct input_event);
+//  struct input_event ev[64];
+//  int i;
+//  while (1){
+//      if ((rd = read (mainbuttonfd, ev, sizeof(ev))) < size)
+//          //perror_exit ("read()");     
+//	print("gaaack\n");
+//
+//	for (i = 0; i < rd / size; i++) {
+//		print("ev[%d]: type = 0x%x, code = 0x%x, value = 0x%x\n", i, ev[i].type, ev[i].code, ev[i].value);
+//	}
+//	mainbuttonread(ev, (rd / size));
+//  }
+//}
+
+static void fbreadvolbutton(void* v)
+{
   int rd, value, size = sizeof(struct input_event);
   struct input_event ev[64];
   int i;
-while (1){
-      if ((rd = read (eventfd, ev, sizeof(ev))) < size)
+  while (1){
+      if ((rd = read (volbuttonfd, ev, sizeof(ev))) < size)
           //perror_exit ("read()");     
 	print("gaaack\n");
 
 	for (i = 0; i < rd / size; i++) {
 		print("ev[%d]: type = 0x%x, code = 0x%x, value = 0x%x\n", i, ev[i].type, ev[i].code, ev[i].value);
 	}
-	touchscreen(ev, (rd / size));
+	volbuttonread(ev, (rd / size));
   }
 }
 
-uchar* attachscreen ( Rectangle *aRectangle, ulong *aChannel, int *aDepth, int *aWidth, int *aSoftScreen )
+uchar* attachscreen ( Rectangle *rect, ulong *chan, int *depth, int *width, int *softscreen )
 {
-  Xsize &= ~0x3;	/* ensure multiple of 4 */
-  aRectangle->min.x = 0;
-  aRectangle->min.y = 0;
-  aRectangle->max.x = Xsize;
-  aRectangle->max.y = Ysize;
+    Xsize &= ~0x3;	/* ensure multiple of 4 */
+    rect->min.x = 0;
+    rect->min.y = 0;
+    rect->max.x = Xsize;
+    rect->max.y = Ysize;
 
-  theDisplayDepth = 32;
- 
-  if ( !theScreenIsInited ) {
-    initScreen ( Xsize, Ysize, &theDisplayChannel, &theDisplayDepth );
-    theScreenData = malloc ( Xsize * Ysize * ( theDisplayDepth / 8  ) );
-    if ( !theScreenData )
-      fprint ( 2, "cannot allocate screen buffer" );
-  }
+    if ( !screeninited ) {
+	initscreen ( Xsize, Ysize, &displaychannel, &displaydepth );
+	screendata = malloc ( Xsize * Ysize * ( displaydepth / 8  ) );
+	if ( !screendata )
+	    fprint ( 2, "cannot allocate screen buffer" );
+    }
 
-  *aChannel = theDisplayChannel;
-  *aDepth = theDisplayDepth;
+    *chan = displaychannel;
+    *depth = displaydepth;
 
-  *aWidth = ( Xsize / 4 ) * ( *aDepth / 8 );
-  *aSoftScreen = 1;
-  if ( !theScreenIsInited ){
-    theScreenIsInited = 1;
-  }
+    *width = ( Xsize / 4 ) * ( *depth / 8 );
+    *softscreen = 1;
+    if ( !screeninited ){
+	screeninited = 1;
+    }
 
-  eventfd = open("/dev/input/event2", O_RDONLY);
-  kproc("readmouse", fbreadmouse, nil, 0);
+	eventfd = open(mousefile, O_RDONLY);
+	kproc("readmouse", fbreadmouse, nil, 0);
 
-  return theScreenData;
+//	mainbuttonfd = open("/dev/input/event1", O_RDONLY);
+//	kproc("readmainbutton", fbreadmainbutton, nil, 0);
+
+	volbuttonfd = open("/dev/input/event0", O_RDONLY);
+	kproc("readvolbutton", fbreadvolbutton, nil, 0);
+
+    return screendata;
 }
 
 void detachscreen ()
 {
-  free ( theScreenData );
-  theScreenData = 0;
-  framebuffer_release_buffer ( theFrameBuffer );
-  theFrameBuffer = 0;
-  framebuffer_deinit ();
+    free ( screendata );
+    screendata = 0;
+    framebuffer_release_buffer ( framebuffer );
+    framebuffer = 0;
+    framebuffer_deinit ();
 }
 
 #define max(a,b) (((a)>(b))?(a):(b))
 #define min(a,b) (((a)<(b))?(a):(b))
 
-void flushmemscreen ( Rectangle aRectangle )
+void flushmemscreen ( Rectangle rect )
 {
-  if ( !theFrameBuffer || !theScreenData )
-    return;
-  int aDepth = theDisplayDepth / 8;
-  int aBytesPerLine = Xsize * aDepth;
-  int i;
-  uchar* aFrameBuffer = theFrameBuffer;
-  uchar* aScreenData = theScreenData;
-  int aWidth;
+    if ( !framebuffer || !screendata )
+	return;
+    int depth = displaydepth / 8;
+    int bpl = Xsize * depth;
+    int i, j;
+    uchar* fb = framebuffer;
+    uchar* screen = screendata;
+    int width;
+    double angle = 3.14159265 / 2;
+    int x,y,u,v;
 
-  if ( aRectangle.min.x < 0 )
-    aRectangle.min.x = 0;
-  if ( aRectangle.min.y < 0 )
-    aRectangle.min.y = 0;
-  if ( aRectangle.max.x > Xsize )
-    aRectangle.max.x = Xsize;
-  if ( aRectangle.max.y > Ysize )
-    aRectangle.max.y = Ysize;
-  
-  if ( ( aRectangle.max.x < aRectangle.min.x ) || ( aRectangle.max.y < aRectangle.min.y ) )
-    return;
+    if ( rect.min.x < 0 )
+	rect.min.x = 0;
+    if ( rect.min.y < 0 )
+	rect.min.y = 0;
+    if ( rect.max.x > Xsize )
+	rect.max.x = Xsize;
+    if ( rect.max.y > Ysize )
+	rect.max.y = Ysize;
 
-  aFrameBuffer += aRectangle.min.y * aBytesPerLine + aRectangle.min.x * aDepth;
-  aScreenData += aRectangle.min.y * aBytesPerLine + aRectangle.min.x * aDepth;
-  aWidth = ( aRectangle.max.x - aRectangle.min.x ) * aDepth;
-  for ( i = aRectangle.min.y; i < aRectangle.max.y; i++ ) {
-    memcpy ( aFrameBuffer, aScreenData, aWidth );
-    aFrameBuffer += aBytesPerLine;
-    aScreenData += aBytesPerLine;
-  }
+    if ( ( rect.max.x < rect.min.x ) || ( rect.max.y < rect.min.y ) )
+	return;
+    if(rotation_opt) {
+	uchar *cur_col;
+	uchar *fb_begin = fb;
+	uchar *scr_begin = screen;
+	int fb_bpl = Ysize * depth;
+	int fb_startx, fb_starty;
+	fb_starty = Xsize - rect.min.x;
+	fb_startx = rect.min.y;
+	fb += fb_starty * fb_bpl + fb_startx * depth;
+	screen += rect.min.y * bpl + rect.min.x * depth;
+	cur_col = fb;
+	for(i = rect.min.y; i < rect.max.y; i++) {
+	    fb = cur_col;
+	    for(j = rect.min.x; j < rect.max.x; j++) {
+		memcpy(fb, screen, depth);
+		fb -= fb_bpl;
+		screen += depth;
+	    }
+	    cur_col += depth;
+	    screen += depth * ((Xsize - rect.max.x) + rect.min.x);
+	}
+    } else {
+	fb += rect.min.y * bpl + rect.min.x * depth;
+	screen += rect.min.y * bpl + rect.min.x * depth;
+	width = ( rect.max.x - rect.min.x ) * depth;
+	for ( i = rect.min.y; i < rect.max.y; i++ ) {
+	    memcpy ( fb, screen, width );
+	    fb += bpl;
+	    screen += bpl;
+	}
 
-  if ( ( max ( aRectangle.min.x, thePointerPosition.x ) > min (aRectangle.max.x, thePointerPosition.x + thePointerWidth ) ) ||
-       ( max ( aRectangle.min.y, thePointerPosition.y ) > min (aRectangle.max.y, thePointerPosition.y + thePointerHeight ) ) ) 
-    return;
-  
-  if ( canlock ( &thePointerLock ) ) {
-    drawPointer ( thePointerPosition.x , thePointerPosition.y );
-    unlock ( &thePointerLock );
-  }
+	if ( ( max ( rect.min.x, pointerposition.x ) > min (rect.max.x, pointerposition.x + pointerwidth ) ) ||
+	     ( max ( rect.min.y, pointerposition.y ) > min (rect.max.y, pointerposition.y + pointerheight ) ) )
+	    return;
+
+	if ( canlock ( &pointerlock ) ) {
+	    drawpointer ( pointerposition.x , pointerposition.y );
+	    unlock ( &pointerlock );
+	}
+    }
 }
-
-int choiseModeCallback ( int x, int y, int bpp, int* callbackInfo )
-{
-  if ( ( x == Xsize ) && ( y == Ysize ) && ( *callbackInfo < ( bpp ) ) )
-    *callbackInfo = bpp;
-  return 0;
-}
-
-int selectModeCallback ( int x, int y, int bpp, int* callbackInfo )
-{
-  if ( ( x == Xsize ) && ( y == Ysize ) && ( *callbackInfo == ( bpp ) ) )
-    return 1;
-  return 0;
-}
-
 #include "arrows.h"
 
-static void initScreen ( int aXSize, int aYSize, ulong *aChannel, int *aDepth )
+static void initscreen ( int aXSize, int aYSize, ulong *chan, int *depth )
 {
-  if ( framebuffer_init () )
-    return;
-/* 
-  if ( framebuffer_enum_modes ( (modeCallback)choiseModeCallback, aDepth ) )
-    return;
+    if ( framebuffer_init () )
+	return;
 
-  if ( framebuffer_enum_modes ( (modeCallback)selectModeCallback, aDepth ) )
-    return;
-*/
-  theFrameBuffer = framebuffer_get_buffer ();
-  switch ( *aDepth ) {
-  case 16: //16bit RGB (2 bytes, red 5@11, green 6@5, blue 5@0) 
-    *aChannel = RGB16;
-    thePointer = PointerRGB16;
-    thePointerWidth = PointerRGB16Width;
-    thePointerHeight = PointerRGB16Height;
-    break;
-  case 24: //24bit RGB (3 bytes, red 8@16, green 8@8, blue 8@0) 
-    *aChannel = RGB24;
-    thePointer = PointerRGB24;
-    thePointerWidth = PointerRGB24Width;
-    thePointerHeight = PointerRGB24Height;
-    break;
-  case 32: //24bit RGB (4 bytes, nothing@24, red 8@16, green 8@8, blue 8@0)
-    *aChannel = XRGB32;
-    thePointer = PointerRGB32;
-    thePointerWidth = PointerRGB32Width;
-    thePointerHeight = PointerRGB32Height;
-    break;
-  }
+    framebuffer = framebuffer_get_buffer ();
+    switch ( *depth ) {
+    case 16: //16bit RGB (2 bytes, red 5@11, green 6@5, blue 5@0) 
+	*chan = RGB16;
+	pointer = PointerRGB16;
+	pointerwidth = PointerRGB16Width;
+	pointerheight = PointerRGB16Height;
+	break;
+    case 24: //24bit RGB (3 bytes, red 8@16, green 8@8, blue 8@0) 
+	*chan = RGB24;
+	pointer = PointerRGB24;
+	pointerwidth = PointerRGB24Width;
+	pointerheight = PointerRGB24Height;
+	break;
+    case 32: //24bit RGB (4 bytes, nothing@24, red 8@16, green 8@8, blue 8@0)
+	*chan = XRGB32;
+	pointer = PointerRGB32;
+	pointerwidth = PointerRGB32Width;
+	pointerheight = PointerRGB32Height;
+	break;
+    }
 }
 
 void setpointer ( int x, int y )
 {
-  if ( !theFrameBuffer || !theScreenData )
-    return;
-  int aDepth = theDisplayDepth / 8;
-  int aBytesPerLine = Xsize * aDepth;
-  int i;
-  uchar* aFrameBuffer = theFrameBuffer + thePointerPosition.y * aBytesPerLine + thePointerPosition.x * aDepth;
-  uchar* aScreenData = theScreenData + thePointerPosition.y * aBytesPerLine + thePointerPosition.x * aDepth;
-  int aWidth = thePointerWidth * aDepth;
-  lock ( &thePointerLock );
-  thePointerPosition.x = x;
-  thePointerPosition.y = y;
-  unlock ( &thePointerLock );
-  for ( i = 0; i < thePointerHeight; i++ ) {
-    memcpy ( aFrameBuffer, aScreenData, aWidth );
-    aFrameBuffer += aBytesPerLine;
-    aScreenData += aBytesPerLine;
-  }
-  drawPointer ( thePointerPosition.x , thePointerPosition.y );  
+    if ( !framebuffer || !screendata )
+	return;
+    if(rotation_opt) {
+	int depth = displaydepth / 8;
+	int bpl = Xsize * depth;
+	int fb_bpl = Ysize * depth;
+	int i, j;
+	uchar *cur_col;
+	uchar *fb = framebuffer + (Xsize - pointerposition.x) * fb_bpl + pointerposition.y * depth;
+	uchar *screen = screendata + pointerposition.y * bpl + (pointerposition.x) * depth;
+	int height = (pointerposition.y + pointerheight > Ysize) ? Ysize - pointerposition.y : pointerheight;
+	lock(&pointerlock);
+	pointerposition.x = x;
+	pointerposition.y = y;
+	unlock(&pointerlock);
+	cur_col = fb;
+	for(i = 0; i < height; i++) {
+	    fb = cur_col;
+	    for(j = 0; j < pointerwidth; j++) {
+		memcpy(fb, screen, depth);
+		fb -= fb_bpl;
+		screen += depth;
+	    }
+	    cur_col += depth;
+	    screen += depth*(Xsize - pointerwidth);
+	}
+	drawpointer(pointerposition.x, pointerposition.y);
+    } else {
+	int depth = displaydepth / 8;
+	int bpl = Xsize * depth;
+	int i;
+	uchar* fb = framebuffer + pointerposition.y * bpl + pointerposition.x * depth;
+	uchar* screen = screendata + pointerposition.y * bpl + pointerposition.x * depth;
+	int width = pointerwidth * depth;
+	lock ( &pointerlock );
+	pointerposition.x = x;
+	pointerposition.y = y;
+	unlock ( &pointerlock );
+	for ( i = 0; i < pointerheight; i++ ) {
+	    memcpy ( fb, screen, width );
+	    fb += bpl;
+	    screen += bpl;
+	}
+	drawpointer ( pointerposition.x , pointerposition.y );
+    }
 }
 
-void drawPointer ( int x, int y )
+void drawpointer ( int x, int y )
 {
-  uchar i,j;
-  uchar aDepth = theDisplayDepth / 8;
-  uchar* aStart = theFrameBuffer + y * Xsize * aDepth + x * aDepth;
-  int aWidth = ( ( x + thePointerWidth ) < Xsize ) ? thePointerWidth : Xsize - x;
-  int aHeight = ( ( y + thePointerHeight ) < Ysize ) ? thePointerHeight : Ysize - y;
-  for ( i = 0; i < aHeight; i++, aStart += Xsize * aDepth )
-    for ( j = 0; j < aWidth * aDepth; j++ ) 
-      aStart [ j ] &= thePointer [ i * aDepth * thePointerWidth + j ];
+    uchar i,j;
+    uchar depth = displaydepth / 8;
+    uchar* aStart = framebuffer + y * Xsize * depth + x * depth;
+    int width = ( ( x + pointerwidth ) < Xsize ) ? pointerwidth : Xsize - x;
+    int aHeight = ( ( y + pointerheight ) < Ysize ) ? pointerheight : Ysize - y;
+    if(rotation_opt) {
+	uchar *cur_col;
+	uchar *fb = framebuffer;
+	int fb_bpl = Ysize * depth;
+	int fb_startx, fb_starty;
+	char empty[depth];
+	char *pointerptr = pointer;
+	for(i = 0; i < depth; i++) {
+	    empty[i] = 0xFF; // initialize white space comparison
+	}
+	fb_starty = Xsize - x;
+	fb_startx = y;
+	fb += fb_starty * fb_bpl + fb_startx * depth;
+	cur_col = fb;
+	for(i = 0; i < aHeight; i++) {
+	    fb = cur_col;
+	    for(j = 0; j < width; j++) {
+		if(memcmp(empty, pointerptr, depth)) {
+		    memcpy(fb, pointerptr, depth);
+		}
+		fb -= fb_bpl;
+		pointerptr += depth;
+	    }
+	    cur_col += depth;
+	}
+    } else {
+	for ( i = 0; i < aHeight; i++, aStart += Xsize * depth )
+	    for ( j = 0; j < width * depth; j++ )
+		aStart [ j ] &= pointer [ i * depth * pointerwidth + j ];
+    }
 }

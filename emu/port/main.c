@@ -12,6 +12,8 @@ static	char	*imod = "/dis/emuinit.dis";
 extern	char*	hosttype;
 char*	tkfont;	/* for libtk/utils.c */
 int	tkstylus;	/* libinterp/tk.c */
+char*	mousefile = "/dev/input/event0";
+char    **eventfiles = NULL;
 extern	int	mflag;
 	int	dflag;
 	int vflag;
@@ -20,20 +22,26 @@ extern	int	mflag;
 	char	*eve;
 	int	Xsize	= 640;
 	int	Ysize	= 480;
+        int     rotation_opt = 0;
 	int	bflag = 1;
 	int	sflag;
 	int	qflag;
 	int	xtblbit;
 	ulong	displaychan;
+	int	displaydepth;
 char *cputype;
 
 static void
 usage(void)
 {
 	fprint(2, "Usage: emu [options...] [file.dis [args...]]\n"
+		"\t-M<devpath>\t#mouse input device path\n"
+		"\t-D[8,16,32]\t#framebuffer depth\n"
 		"\t-gXxY\n"
 		"\t-c[0-9]\n"
 		"\t-d file.dis\n"
+	        "\t-o (orientation flip)\n"
+	        "\t-E<devpath>\t#add a device to the 'events' device\n"
 		"\t-s\n"
 		"\t-v\n"
 		"\t-p<poolname>=maxsize\n"
@@ -121,6 +129,47 @@ option(int argc, char *argv[], void (*badusage)(void))
 	ARGBEGIN {
 	default:
 		badusage();
+	case 'M':
+		cp = EARGF(badusage());
+		mousefile = strdup(cp);
+		break;
+	case 'E': /* event file */
+		cp = EARGF(badusage());
+		char **neweventfiles;
+		int i;
+		int numevents = 0;
+		if(eventfiles == NULL) {
+			neweventfiles = malloc(2*sizeof(char *));
+			neweventfiles[0] = strdup(cp);
+			neweventfiles[1] = NULL;
+		} else {
+			for(i = 0; eventfiles[i] != NULL; i++) {
+				numevents++;
+			}
+			neweventfiles = malloc((numevents + 2) 
+					       * sizeof(char *));
+			for(i = 0; eventfiles[i] != NULL; i++) {
+				neweventfiles[i] = eventfiles[i];
+			}
+			neweventfiles[i] = strdup(cp);
+			neweventfiles[i + 1] = NULL;
+		}
+		if(eventfiles != NULL) {
+			free(eventfiles);
+		}
+		eventfiles = neweventfiles;
+		for(i = 0; i < numevents; i++) {
+			printf("numevents = %d %d %s\n", numevents, i, eventfiles[i]);
+		}
+		break;
+	case 'D':	/* framebuffer depth */
+		cp = EARGF(badusage());
+		if (!isnum(cp))
+			badusage();
+		displaydepth = atoi(cp);
+		if (!(displaydepth == 8 || displaydepth == 16 || displaydepth == 32))
+			usage();
+		break;
 	case 'g':		/* Window geometry */
 		if (geom(EARGF(badusage())) == 0)
 			badusage();
@@ -158,6 +207,9 @@ option(int argc, char *argv[], void (*badusage)(void))
 		break;
 	case 'p':		/* pool option */
 		poolopt(EARGF(badusage()));
+		break;
+	case 'o':
+	        rotation_opt = 1;
 		break;
 	case 'f':		/* Set font path */
 		tkfont = EARGF(badusage());
