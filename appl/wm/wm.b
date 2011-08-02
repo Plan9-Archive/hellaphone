@@ -834,6 +834,7 @@ monitor_button(ch : chan of string, win : ref Wmclient->Window, wmctxt: ref Wmco
 	}
 
 	while(1) {
+		newstr : string;
 		buf := array[64] of byte;
 		n := sys->read(fd, buf, len buf);
 		if(n == 0) {
