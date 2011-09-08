@@ -1,13 +1,9 @@
 /* TODO/BUGS in no order:
    should send acknowledgement when an sms is read from /phone/sms, not just on every read
-   decode_sms is sloppy--should convert septets into octets, then convert octets into UTF-8 instead of trying to do it all at once. split off into separate functions?
-   handle sending/receiving multiple text messages and checking length of messages sent to /phone/sms
    consider notifying RIL of screen state using RIL_REQUEST_SCREEN_STATE to conserve power
    too many assumptions made in loop_for_data() about read() giving exactly the right amount of data
    parcel code will go crazy if ints overflow
-   no way to give an error if SMSes don't send
    need to support DTMF
-   get calling number when ring event occurs (through CALL_STATE_CHANGED?)
 */
 
 #include "dat.h"
@@ -29,7 +25,6 @@
 #include <fcntl.h>
 #include <semaphore.h>
 #include <dlfcn.h>
-#include "asound.h"
 #include "smsutils.h"
 #include "parcel.h"
 
@@ -39,22 +34,6 @@
 #define RESPONSE_UNSOLICITED 1
 #define POWER_ON 2000
 #define POWER_OFF 2001
-
-typedef enum _SoundType {
-    SOUND_TYPE_VOICE,
-    SOUND_TYPE_SPEAKER,
-    SOUND_TYPE_HEADSET,
-    SOUND_TYPE_BTVOICE
-} SoundType;
-
-typedef enum _AudioPath {
-    SOUND_AUDIO_PATH_HANDSET,
-    SOUND_AUDIO_PATH_HEADSET,
-    SOUND_AUDIO_PATH_SPEAKER,
-    SOUND_AUDIO_PATH_BLUETOOTH,
-    SOUND_AUDIO_PATH_BLUETOOTH_NO_NR,
-    SOUND_AUDIO_PATH_HEADPHONE
-} AudioPath;
 
 // Inferno-related globals
 
@@ -88,7 +67,7 @@ static int fd;
 static int power_state = 0;
 
 static struct {
-	QLock rl;
+	QLock l;
 	Rendez r;
 	int ready;
 	int used;
@@ -96,7 +75,7 @@ static struct {
 } status_msg;
 
 static struct {
-	QLock rl;
+	QLock l;
 	Rendez r;
 	int ready;
 	int used;
@@ -104,12 +83,19 @@ static struct {
 	int num;
 } calls;
 
-void loop_for_data(void *v);
-void send_sms(char *smsc_pdu, char *pdu);
-void dial(char *number);
-void activate_net(void);
-void deactivate_net(void);
-void radio_power(int power);
+static void loop_for_data(void *v);
+static void send_sms(char *smsc_pdu, char *pdu);
+static void dial(char *number);
+static void activate_net(void);
+static void deactivate_net(void);
+static void radio_power(int power);
+static void answer(void);
+static void acknowledge_sms(void);
+static void get_reg_state(void);
+static void set_mute(int);
+static void get_current_calls(void);
+static void hangup(int);
+static void hangup_current(void);
 
 // AudioFlinger layer stuff
 static void *af_handle;
@@ -120,27 +106,30 @@ void (*af_setParameters)(char *);
 void (*af_test)(void);
 
 enum audio_mode {
-        MODE_INVALID = -2,
-        MODE_CURRENT = -1,
-        MODE_NORMAL = 0,
-        MODE_RINGTONE,
-        MODE_IN_CALL,
-        MODE_IN_COMMUNICATION,
-        NUM_MODES  // not a valid entry, denotes end-of-list
+	MODE_INVALID = -2,
+	MODE_CURRENT = -1,
+	MODE_NORMAL = 0,
+	MODE_RINGTONE,
+	MODE_IN_CALL,
+	MODE_IN_COMMUNICATION,
+	NUM_MODES  // not a valid entry, denotes end-of-list
 };
 
 
-int calls_ready(void *unused)
+static int
+calls_ready(void *unused)
 {
 	return calls.ready;
 }
 
-int status_ready(void *unused)
+static int
+status_ready(void *unused)
 {
 	return status_msg.ready;
 }
 
-void phoneinit(void)
+void
+phoneinit(void)
 {
 	af_handle = dlopen("libinfernoaudio.so", RTLD_NOW);
 	if(af_handle == NULL) {
@@ -162,11 +151,11 @@ void phoneinit(void)
 	calls.num = 0;
 	calls.ready = 0;
 	calls.used = 0;
-	memset(&calls.rl, 0, sizeof(QLock));
+	memset(&calls.l, 0, sizeof(QLock));
 
 	status_msg.ready = 0;
 	status_msg.used = 0;
-	memset(&status_msg.rl, 0, sizeof(QLock));
+	memset(&status_msg.l, 0, sizeof(QLock));
 	phoneq = qopen(512, 0, nil, nil);
 	if(phoneq == 0)
 		panic("no memory");
@@ -201,35 +190,39 @@ void phoneinit(void)
 	kproc("phone", loop_for_data, 0, 0);
 }
 
-static Chan *phoneattach(char *spec)
+static Chan*
+phoneattach(char *spec)
 {
 	// setup kprocs if necessary
 	return devattach('f', spec);
 }
 
-static Walkqid *phonewalk(Chan *c, Chan *nc, char **name, int nname)
+static Walkqid*
+phonewalk(Chan *c, Chan *nc, char **name, int nname)
 {
 	return devwalk(c, nc, name, nname, phonetab, nelem(phonetab), devgen);
 }
 
-static int phonestat(Chan *c, uchar *db, int n)
+static int
+phonestat(Chan *c, uchar *db, int n)
 {
 	return devstat(c, db, n, phonetab, nelem(phonetab), devgen);
 }
 
-static Chan *phoneopen(Chan *c, int omode)
+static Chan*
+phoneopen(Chan *c, int omode)
 {
 	c = devopen(c, omode, phonetab, nelem(phonetab), devgen);
 
 	switch((ulong) c->qid.path) {
 	case Qstatus:
-		qlock(&status_msg.rl);
+		qlock(&status_msg.l);
 		status_msg.used = 0;
 		status_msg.ready = 0;
 		get_reg_state();
 		break;
 	case Qcalls:
-		qlock(&calls.rl);
+		qlock(&calls.l);
 		calls.used = 0;
 		calls.ready = 0;
 		get_current_calls();
@@ -239,13 +232,15 @@ static Chan *phoneopen(Chan *c, int omode)
 	return c;
 }
 
-static void phoneclose(Chan *c)
+static void
+phoneclose(Chan *c)
 {
 	if((c->flag & COPEN) == 0)
 		return;
 }
 
-static long phoneread(Chan *c, void *va, long n, vlong offset)
+static long
+phoneread(Chan *c, void *va, long n, vlong offset)
 {
 	char buf[255];
 	int i, str_offset;
@@ -270,7 +265,7 @@ static long phoneread(Chan *c, void *va, long n, vlong offset)
 		if(status_msg.ready == -1) {
 			// an error occurred
 			status_msg.used = 1;
-			qunlock(&status_msg.rl);
+			qunlock(&status_msg.l);
 			return readstr(offset, va, n, "error\n");
 		}
 		if(status_msg.used) {
@@ -285,13 +280,13 @@ static long phoneread(Chan *c, void *va, long n, vlong offset)
 		if(calls.ready == -1) {
 			// an error occurred
 			calls.used = 1;
-			qunlock(&calls.rl);
+			qunlock(&calls.l);
 			return readstr(offset, va, n, "");
 		}
 		if(calls.used || calls.num == 0) {
 			calls.ready = 0;
 			calls.used = 0;
-			qunlock(&calls.rl);
+			qunlock(&calls.l);
 			return 0; // already sent the data
 		}
 		calls.used = 1;
@@ -311,13 +306,14 @@ static long phoneread(Chan *c, void *va, long n, vlong offset)
 					       c.numberPresentation, c.name,
 					       c.namePresentation);
 		}
-		qunlock(&calls.rl);
+		qunlock(&calls.l);
 		return str_offset;
 	}
 	return 0;
 }
 
-static long phonewrite(Chan *c, void *va, long n, vlong offset)
+static long
+phonewrite(Chan *c, void *va, long n, vlong offset)
 {
 	char *pdu;
 	char *args[5];
@@ -362,7 +358,15 @@ static long phonewrite(Chan *c, void *va, long n, vlong offset)
 			}
 		} else if(strcmp(args[0], "volume") == 0) {
 			if(nargs >= 2) {
-				af_setVoiceVolume(strtod(args[1], NULL));
+				switch(strtol(args[1], NULL, 10)) {
+				case 0: af_setVoiceVolume(0.0); break;
+				case 1: af_setVoiceVolume(0.2); break;
+				case 2: af_setVoiceVolume(0.4); break;
+				case 3: af_setVoiceVolume(0.6); break;
+				case 4: af_setVoiceVolume(0.8); break;
+				case 5: af_setVoiceVolume(1.0); break;
+				default: af_setVoiceVolume(1.0); break;
+				}
 			}
 		}
 		free(str);
@@ -406,7 +410,7 @@ static long phonewrite(Chan *c, void *va, long n, vlong offset)
 			dial(args[1]);
 		} else if(strcmp(args[0], "hangup") == 0) {
 			if(nargs == 2) {
-				hangup(args[1]);
+				hangup(strtol(args[1], NULL, 10));
 			} else {
 				hangup_current();
 			}
@@ -438,10 +442,11 @@ Dev phonedevtab = {
 
 /* RIL functions */
 
-void handle_error(int seq, int error)
+static void
+handle_error(int seq, int error)
 {
 	// RIL error messages
-	char *errmsgs[] = { "no error", "radio not available", "generic failure", "password incorrect", "need SIM PIN2", "need SIM PUK2", "request not supported", "cancelled", "cannot access network during voice calls", "cannot access network before registering to network", "retry sending sms", "no SIM", "no subscription", "mode not supported", "FDN list check failed", "illegal SIM or ME" };
+	char *errmsgs[] = { "error: no error", "error: radio not available", "error: generic failure", "error: password incorrect", "error: need SIM PIN2", "error: need SIM PUK2", "error: request not supported", "error: cancelled", "error: cannot access network during voice calls", "error: cannot access network before registering to network", "error: retry sending sms", "error: no SIM", "error: no subscription", "error: mode not supported", "error: FDN list check failed", "error: illegal SIM or ME" };
 	char *errmsg = errmsgs[error];
 	switch(seq) {
 	case RIL_REQUEST_SEND_SMS:
@@ -453,17 +458,21 @@ void handle_error(int seq, int error)
 	case RIL_REQUEST_REGISTRATION_STATE:
 		status_msg.ready = -1;
 		Wakeup(&status_msg.r);
-		qunlock(&status_msg.rl);
+		qunlock(&status_msg.l);
 		break;
 	case RIL_REQUEST_GET_CURRENT_CALLS:
 		calls.ready = -1;
 		Wakeup(&calls.r);
-		qunlock(&calls.rl);
+		qunlock(&calls.l);
 		break;
 	}
 }
 
-void handle_sol_response(struct parcel *p)
+/* handle_sol_response is called when we recieve a solicited response from RIL,
+   i.e. the response to a request we sent. The response can contain data we
+   asked for, indicate an error, or simply indicate success. */
+static void
+handle_sol_response(struct parcel *p)
 {
 	int seq, error, i, num, offset = 0;
 	char buf[200];
@@ -500,7 +509,7 @@ void handle_sol_response(struct parcel *p)
 		status_msg.msg = strdup(buf);
 		status_msg.ready = 1;
 		Wakeup(&status_msg.r);
-		qunlock(&status_msg.rl);
+		qunlock(&status_msg.l);
 		break;
 	case RIL_REQUEST_DIAL:
 		printf("got RIL_REQUEST_DIAL success\n");
@@ -510,7 +519,7 @@ void handle_sol_response(struct parcel *p)
 			calls.ready = 1;
 			calls.num = 0;
 			Wakeup(&calls.r);
-			qunlock(&calls.rl);
+			qunlock(&calls.l);
 			break;
 		}
 
@@ -527,7 +536,7 @@ void handle_sol_response(struct parcel *p)
 			fprintf(stderr, "malloc failed while making %d RIL_Calls\n", num);
 			calls.ready = -1;
 			Wakeup(&calls.r);
-			qunlock(&calls.rl);
+			qunlock(&calls.l);
 			break;
 		}
 
@@ -554,12 +563,16 @@ void handle_sol_response(struct parcel *p)
 		}
 		calls.ready = 1;
 		Wakeup(&calls.r);
-		qunlock(&calls.rl);
+		qunlock(&calls.l);
 		break;
 	}
 }
 
-void handle_unsol_response(struct parcel *p)
+/* handle_unsol_response is called when we receive an unsolicited response from
+   RIL. Unsolicited responses inform us of events like an incoming call or
+   SMS. */
+static void
+handle_unsol_response(struct parcel *p)
 {
 	int resp_type;
 	char buf[300];
@@ -590,12 +603,17 @@ void handle_unsol_response(struct parcel *p)
 		// TODO: use bit error rate instead of cell tower reception
 		// when available (during a call)
 		break;
+	case RIL_UNSOL_RESPONSE_CALL_STATE_CHANGED:
+		print("call state changed\n");
+		qproduce(phoneq, "call state changed\n", 20);
+		break;
 	}
 }
 
 // FIXME: read() needs to be handled better in this function, allow it to
 // underrun and just loop again to get the rest of the data
-void loop_for_data(void *v)
+static void
+loop_for_data(void *v)
 {
 	seteuid(1001);
 	for(;;) {
@@ -644,7 +662,8 @@ void loop_for_data(void *v)
 	}
 }
 
-void send_ril_parcel(struct parcel *p)
+static void
+send_ril_parcel(struct parcel *p)
 {
 	int pktlen, ret;
 
@@ -656,7 +675,8 @@ void send_ril_parcel(struct parcel *p)
 	if(ret < 0) perror("write to ril failed");
 }
 
-void answer(void)
+static void
+answer(void)
 {
 	struct parcel p;
 	
@@ -668,7 +688,8 @@ void answer(void)
 	parcel_free(&p);
 }
 
-void radio_power(int power)
+static void
+radio_power(int power)
 {
 	struct parcel p;
 
@@ -682,7 +703,8 @@ void radio_power(int power)
 	parcel_free(&p);
 }
 
-void dial(char *number)
+static void
+dial(char *number)
 {
 	struct parcel p;
 	struct mixer *mixer;
@@ -706,7 +728,8 @@ void dial(char *number)
 	parcel_free(&p);
 }
 
-void activate_net(void)
+static void
+activate_net(void)
 {
 	struct parcel p;
 
@@ -725,7 +748,8 @@ void activate_net(void)
 	parcel_free(&p);
 }
 
-void deactivate_net(void)
+static void
+deactivate_net(void)
 {
 	struct parcel p;
 	
@@ -738,7 +762,8 @@ void deactivate_net(void)
 	parcel_free(&p);
 }
 
-void send_sms(char *smsc_pdu, char *pdu)
+static void
+send_sms(char *smsc_pdu, char *pdu)
 {
 	struct parcel p;
 
@@ -753,7 +778,8 @@ void send_sms(char *smsc_pdu, char *pdu)
 	parcel_free(&p);
 }
 
-void acknowledge_sms(void)
+static void
+acknowledge_sms(void)
 {
 	struct parcel p;
 
@@ -768,7 +794,8 @@ void acknowledge_sms(void)
 	parcel_free(&p);
 }
 
-void get_reg_state(void)
+static void
+get_reg_state(void)
 {
 	struct parcel p;
 	
@@ -780,7 +807,8 @@ void get_reg_state(void)
 	parcel_free(&p);
 }
 
-void set_mute(int muted)
+static void
+set_mute(int muted)
 {
 	struct parcel p;
 	
@@ -794,7 +822,8 @@ void set_mute(int muted)
 	parcel_free(&p);
 }
 
-void get_current_calls(void)
+static void
+get_current_calls(void)
 {
 	struct parcel p;
 
@@ -806,7 +835,8 @@ void get_current_calls(void)
 	parcel_free(&p);
 }
 
-void hangup(int index)
+static void
+hangup(int index)
 {
 	struct parcel p;
 	
@@ -820,7 +850,8 @@ void hangup(int index)
 	parcel_free(&p);
 }
 
-void hangup_current(void)
+static void
+hangup_current(void)
 {
 	struct parcel p;
 	
