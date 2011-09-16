@@ -88,5 +88,4 @@ void modinit(void){
 
 	int dontcompile = 1;
 char* conffile = "emu-g";
-#define KERNDATE 0
 ulong kerndate = KERNDATE;
